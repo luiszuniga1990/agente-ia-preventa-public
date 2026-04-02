@@ -1,0 +1,648 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Agente IA Preventa — Chatbot serverless para generación de estimaciones
+  de costos de Amazon Quick, Amazon Connect y Amazon Bedrock AgentCore.
+
+# ============================================================
+# Parámetros globales
+# ============================================================
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        AWS_REGION_DEPLOY: us-east-1
+        CONVERSATIONS_TABLE: !Ref ConversationsTable
+        ESTIMATIONS_TABLE: !Ref EstimationsTable
+        PRICING_CACHE_TABLE: !Ref PricingCacheTable
+        PARTNERS_TABLE: !Ref PartnersTable
+        FILES_BUCKET: !Ref FilesBucket
+        SES_SENDER_EMAIL: !Ref SesSenderEmail
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: Nombre del stage de despliegue
+  SesSenderEmail:
+    Type: String
+    Default: noreply@preventa.example.com
+    Description: Dirección de correo verificada en SES para envío de emails
+  CognitoDomain:
+    Type: String
+    Default: agente-preventa
+    Description: Prefijo de dominio para Cognito Hosted UI
+
+# ============================================================
+# Recursos
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # Cognito User Pool — Autenticación de usuarios preventa
+  # ----------------------------------------------------------
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: agente-preventa-user-pool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: true
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: agente-preventa-web-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}"
+      LogoutURLs:
+        - !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${CognitoDomain}-${AWS::StackName}"
+      UserPoolId: !Ref CognitoUserPool
+
+
+  # ----------------------------------------------------------
+  # DynamoDB — 4 tablas con GSIs
+  # ----------------------------------------------------------
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: conversations
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: conversation_id
+          KeyType: HASH
+        - AttributeName: user_id
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: conversation_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  EstimationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: estimations
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: estimation_id
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: estimation_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  PricingCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: pricing_cache
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: service_id
+          KeyType: HASH
+        - AttributeName: component
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: service_id
+          AttributeType: S
+        - AttributeName: component
+          AttributeType: S
+
+  PartnersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: partners
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: partner_id
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: partner_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+
+  # ----------------------------------------------------------
+  # S3 — Bucket web (hosting estático) + Bucket archivos (PDFs/JSONs)
+  # ----------------------------------------------------------
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "agente-preventa-web-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "agente-preventa-files-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldFiles
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # ----------------------------------------------------------
+  # CloudFront — Distribución para el bucket web
+  # ----------------------------------------------------------
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: agente-preventa-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3WebOrigin
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3WebOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+
+  # ----------------------------------------------------------
+  # API Gateway — WebSocket API
+  # ----------------------------------------------------------
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: agente-preventa-websocket
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref StageName
+      AutoDeploy: true
+
+  # Ruta $connect
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${ConnectIntegration}"
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations"
+
+  # Ruta $disconnect
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${DisconnectIntegration}"
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations"
+
+  # Ruta $default (mensajes de chat)
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${DefaultIntegration}"
+
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatHandlerFunction.Arn}/invocations"
+
+
+  # ----------------------------------------------------------
+  # API Gateway — REST API con autorizador Cognito
+  # ----------------------------------------------------------
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: agente-preventa-rest
+      StageName: !Ref StageName
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+
+  # ----------------------------------------------------------
+  # Lambda — 7 funciones con roles IAM de mínimo privilegio
+  # ----------------------------------------------------------
+
+  # 1. ws_connect — Maneja $connect y $disconnect del WebSocket
+  WsConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agente-preventa-ws-connect
+      Handler: src/handlers/ws_connect.handler
+      Description: Maneja conexión y desconexión WebSocket ($connect/$disconnect)
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationsTable
+
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+
+  # 2. chat_handler — Procesa mensajes del WebSocket ($default)
+  ChatHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agente-preventa-chat-handler
+      Handler: src/handlers/chat_handler.handler
+      Timeout: 60
+      MemorySize: 512
+      Description: Procesa mensajes de chat vía WebSocket, invoca Bedrock
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          WEBSOCKET_API_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+          BEDROCK_MODEL_ID: amazon.nova-pro-v1:0
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PricingCacheTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EstimationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PartnersTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${StageName}/POST/@connections/*"
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+
+  ChatHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChatHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+
+
+  # 3. rest_api — Router REST para endpoints CRUD
+  RestApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agente-preventa-rest-api
+      Handler: src/handlers/rest_api.handler
+      Description: Router REST — estimaciones, conversaciones, exportación, consolidación, email
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EstimationsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PricingCacheTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PartnersTable
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendRawEmail
+                - ses:SendEmail
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0"
+      Events:
+        GetEstimations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /estimations
+            Method: GET
+        GetEstimationById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /estimations/{id}
+            Method: GET
+        ExportEstimation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /estimations/{id}/export
+            Method: POST
+        ConsolidateEstimation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /estimations/{id}/consolidate
+            Method: POST
+        EmailEstimation:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /estimations/{id}/email
+            Method: POST
+        GetConversations:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /conversations
+            Method: GET
+        GetConversationById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /conversations/{id}
+            Method: GET
+
+  # 4. pdf_handler — Generación de PDF/CSV
+  PdfHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agente-preventa-pdf-handler
+      Handler: src/handlers/pdf_handler.handler
+      Timeout: 60
+      MemorySize: 512
+      Description: Genera PDFs y CSVs de estimaciones, sube a S3
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EstimationsTable
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+
+
+  # 5. consolidation_handler — Consolidación de estimaciones externas
+  ConsolidationHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agente-preventa-consolidation-handler
+      Handler: src/handlers/consolidation_handler.handler
+      Description: Consolida estimaciones internas con datos externos (JSON)
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EstimationsTable
+
+  # 6. email_handler — Envío de correos con SES
+  EmailHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agente-preventa-email-handler
+      Handler: src/handlers/email_handler.handler
+      Timeout: 60
+      Description: Envía estimaciones por correo electrónico vía SES con PDF adjunto
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EstimationsTable
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendRawEmail
+                - ses:SendEmail
+              Resource: "*"
+
+  # 7. pricing_updater — Actualización diaria de precios (EventBridge cron)
+  PricingUpdaterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: agente-preventa-pricing-updater
+      Handler: src/handlers/pricing_updater.handler
+      Timeout: 120
+      Description: Actualiza precios diariamente desde URLs oficiales de AWS
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PricingCacheTable
+      Events:
+        DailyCron:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 6 * * ? *)
+            Description: Actualización diaria de precios a las 6 AM UTC
+            Enabled: true
+
+
+  # ----------------------------------------------------------
+  # SES — Identidad de correo verificada
+  # ----------------------------------------------------------
+  SesEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SesSenderEmail
+
+# ============================================================
+# Outputs — Valores de referencia post-despliegue
+# ============================================================
+Outputs:
+  CognitoUserPoolId:
+    Description: ID del Cognito User Pool
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: ID del cliente de Cognito
+    Value: !Ref CognitoUserPoolClient
+
+  CognitoLoginUrl:
+    Description: URL de login de Cognito Hosted UI
+    Value: !Sub "https://${CognitoDomain}-${AWS::StackName}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${CognitoUserPoolClient}&response_type=token&scope=openid+email+profile&redirect_uri=https://${CloudFrontDistribution.DomainName}"
+
+  WebSocketApiEndpoint:
+    Description: Endpoint del WebSocket API
+    Value: !Sub "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  RestApiEndpoint:
+    Description: Endpoint del REST API
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  CloudFrontUrl:
+    Description: URL de la aplicación web (CloudFront)
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  WebBucketName:
+    Description: Nombre del bucket S3 para hosting web
+    Value: !Ref WebBucket
+
+  FilesBucketName:
+    Description: Nombre del bucket S3 para archivos (PDFs/JSONs)
+    Value: !Ref FilesBucket
+
+  ConversationsTableName:
+    Description: Nombre de la tabla DynamoDB de conversaciones
+    Value: !Ref ConversationsTable
+
+  EstimationsTableName:
+    Description: Nombre de la tabla DynamoDB de estimaciones
+    Value: !Ref EstimationsTable
+
+  PricingCacheTableName:
+    Description: Nombre de la tabla DynamoDB de caché de precios
+    Value: !Ref PricingCacheTable
+
+  PartnersTableName:
+    Description: Nombre de la tabla DynamoDB de partners
+    Value: !Ref PartnersTable

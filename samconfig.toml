@@ -1,0 +1,22 @@
+# Configuración de despliegue para SAM CLI
+# Ejecutar: sam deploy --config-file samconfig.toml
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "agente-ia-preventa"
+region = "us-east-1"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+s3_prefix = "agente-ia-preventa"
+parameter_overrides = "StageName=prod SesSenderEmail=noreply@preventa.example.com CognitoDomain=agente-preventa"
+
+[default.build.parameters]
+use_container = false
+
+[default.validate.parameters]
+lint = true
+
+[default.sync.parameters]
+watch = true

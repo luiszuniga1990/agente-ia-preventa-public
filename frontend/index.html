@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Agente IA Preventa - Estimaciones de costos para servicios AWS">
+    <title>Agente IA Preventa</title>
+
+    <!-- Estilos -->
+    <link rel="stylesheet" href="css/styles.css">
+
+    <!-- Amazon Cognito Identity SDK (vía CDN) -->
+    <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6/dist/amazon-cognito-identity.min.js"></script>
+</head>
+<body>
+    <!-- Enlace de salto para accesibilidad (navegación por teclado) -->
+    <a href="#chat-input" class="skip-link">Ir al chat</a>
+
+    <!-- ============================================ -->
+    <!-- VISTA DE LOGIN                               -->
+    <!-- ============================================ -->
+    <div id="login-view" class="login-view">
+        <div class="login-card" role="main">
+            <h1>🤖 Agente IA Preventa</h1>
+            <p class="subtitle">Estimaciones de costos AWS</p>
+
+            <form id="login-form" aria-label="Formulario de inicio de sesión">
+                <div id="login-error" class="login-error hidden" role="alert"></div>
+
+                <div class="form-group">
+                    <label for="login-username">Usuario</label>
+                    <input
+                        type="text"
+                        id="login-username"
+                        name="username"
+                        autocomplete="username"
+                        required
+                        aria-required="true"
+                        placeholder="tu.usuario"
+                    >
+                </div>
+
+                <div class="form-group">
+                    <label for="login-password">Contraseña</label>
+                    <input
+                        type="password"
+                        id="login-password"
+                        name="password"
+                        autocomplete="current-password"
+                        required
+                        aria-required="true"
+                        placeholder="••••••••"
+                    >
+                </div>
+
+                <button type="submit" id="login-btn" class="btn-primary">
+                    Iniciar Sesión
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- ============================================ -->
+    <!-- VISTA PRINCIPAL DE LA APLICACIÓN              -->
+    <!-- ============================================ -->
+    <div id="app-view" class="app-view hidden">
+
+        <!-- Header -->
+        <header class="app-header" role="banner">
+            <div class="logo">
+                <span class="logo-icon" aria-hidden="true">🤖</span>
+                <span class="logo-text">Agente IA Preventa</span>
+            </div>
+            <div class="header-actions">
+                <span id="user-email" class="user-email" aria-label="Usuario actual"></span>
+                <button id="logout-btn" class="btn-logout" aria-label="Cerrar sesión">
+                    Salir
+                </button>
+            </div>
+        </header>
+
+        <!-- Sidebar: conversaciones -->
+        <aside class="sidebar" role="complementary" aria-label="Panel de conversaciones">
+            <div class="sidebar-header">
+                <button id="new-chat-btn" class="btn-new-chat" aria-label="Iniciar nueva conversación">
+                    + Nueva Conversación
+                </button>
+            </div>
+
+            <div class="sidebar-section-title">Conversaciones recientes</div>
+            <nav id="conversation-list" class="conversation-list" aria-label="Lista de conversaciones">
+                <p class="empty-list">Cargando conversaciones...</p>
+            </nav>
+
+            <div class="sidebar-footer">
+                <button id="history-btn" class="btn-history" aria-label="Recargar historial de conversaciones">
+                    🔄 Actualizar historial
+                </button>
+            </div>
+        </aside>
+
+        <!-- Área principal de chat -->
+        <main class="chat-area" role="main">
+            <!-- Estado de conexión -->
+            <div id="connection-status" class="connection-status" role="status" aria-live="polite">
+                Conectando...
+            </div>
+
+            <!-- Mensajes del chat -->
+            <div id="chat-messages" class="chat-messages" role="log" aria-label="Mensajes del chat" aria-live="polite">
+                <!-- Los mensajes se insertan dinámicamente -->
+            </div>
+
+            <!-- Panel de acciones (exportar, consolidar) — visible cuando hay estimación -->
+            <div id="actions-panel" class="actions-panel hidden" role="toolbar" aria-label="Acciones de estimación">
+                <span class="actions-label">Acciones:</span>
+                <button id="export-pdf-btn" class="btn-action" aria-label="Descargar estimación en PDF">
+                    📄 PDF
+                </button>
+                <button id="export-csv-btn" class="btn-action" aria-label="Descargar estimación en CSV">
+                    📊 CSV
+                </button>
+                <button id="upload-json-btn" class="btn-action" aria-label="Subir archivo JSON para consolidación">
+                    📁 Consolidar JSON
+                </button>
+                <!-- Input oculto para selección de archivo -->
+                <input
+                    type="file"
+                    id="json-file-input"
+                    accept=".json"
+                    class="hidden"
+                    aria-label="Seleccionar archivo JSON"
+                >
+            </div>
+
+            <!-- Input de chat -->
+            <div class="chat-input-area">
+                <textarea
+                    id="chat-input"
+                    rows="1"
+                    placeholder="Escribe tu mensaje... (Enter para enviar)"
+                    aria-label="Mensaje para el agente"
+                ></textarea>
+                <button id="send-btn" class="btn-send" aria-label="Enviar mensaje">
+                    Enviar
+                </button>
+            </div>
+        </main>
+    </div>
+
+    <!-- Notificación flotante -->
+    <div id="notification" class="notification hidden" role="alert" aria-live="assertive"></div>
+
+    <!-- Scripts de la aplicación (orden importa: config → auth → chat → api → app) -->
+    <script src="js/config.js"></script>
+    <script src="js/auth.js"></script>
+    <script src="js/chat.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

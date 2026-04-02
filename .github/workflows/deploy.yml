@@ -1,0 +1,123 @@
+# Pipeline CI/CD — Agente IA Preventa
+# Trigger: push a main
+# Pasos: instalar dependencias → tests unitarios → tests de propiedades → deploy SAM
+name: Deploy Agente IA Preventa
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  SAM_STACK_NAME: agente-ia-preventa
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ============================================================
+  # Job 1: Tests (unitarios + propiedades)
+  # ============================================================
+  test:
+    name: Ejecutar tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar tests unitarios
+        run: pytest tests/unit/ -v --cov=src --cov-report=xml --tb=short
+
+      - name: Ejecutar tests de propiedades
+        run: pytest tests/property/ -v --hypothesis-seed=0 --tb=short
+
+  # ============================================================
+  # Job 2: Build y Deploy con SAM
+  # ============================================================
+  deploy:
+    name: Deploy a AWS
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Instalar SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: SAM Build
+        run: sam build --use-container
+
+      - name: SAM Deploy
+        run: |
+          sam deploy \
+            --stack-name ${{ env.SAM_STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              StageName=prod \
+              SesSenderEmail=${{ secrets.SES_SENDER_EMAIL }} \
+              CognitoDomain=agente-preventa
+
+      - name: Subir frontend a S3
+        run: |
+          WEB_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.SAM_STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='WebBucketName'].OutputValue" \
+            --output text)
+          aws s3 sync frontend/ s3://$WEB_BUCKET/ --delete
+
+      - name: Invalidar caché de CloudFront
+        run: |
+          CF_DIST_ID=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.SAM_STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudFrontUrl'].OutputValue" \
+            --output text)
+          # Obtener el ID de distribución desde el dominio
+          DIST_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?DomainName=='${CF_DIST_ID#https://}'].Id" \
+            --output text)
+          if [ -n "$DIST_ID" ]; then
+            aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*"
+          fi
+
+      # Rollback automático en caso de fallo de despliegue
+      - name: Rollback en caso de fallo
+        if: failure()
+        run: |
+          echo "⚠️ Despliegue fallido — ejecutando rollback..."
+          aws cloudformation rollback-stack \
+            --stack-name ${{ env.SAM_STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} || true
+          echo "Rollback completado. Revisar logs para detalles del fallo."
